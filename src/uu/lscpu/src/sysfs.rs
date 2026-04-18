@@ -23,8 +23,8 @@ pub struct CpuTopology {
 #[derive(Debug)]
 pub struct Cpu {
     _index: usize,
-    pub pkg_id: usize,
-    pub core_id: usize,
+    pub pkg_id: Option<usize>,
+    pub core_id: Option<usize>,
     pub caches: Vec<CpuCache>,
 }
 
@@ -59,16 +59,12 @@ impl CpuTopology {
             );
 
             let pkg_id = fs::read_to_string(cpu_dir.join("topology/physical_package_id"))
-                .unwrap()
-                .trim()
-                .parse::<usize>()
-                .unwrap();
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok());
 
             let core_id = fs::read_to_string(cpu_dir.join("topology/core_id"))
-                .unwrap()
-                .trim()
-                .parse::<usize>()
-                .unwrap();
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok());
 
             let caches = read_cpu_caches(root, cpu_index);
 
@@ -85,13 +81,13 @@ impl CpuTopology {
     pub fn socket_count(&self) -> usize {
         // Each physical socket is represented as its own package_id, so amount of unique pkg_ids = sockets
         // https://www.kernel.org/doc/html/latest/admin-guide/abi-stable.html#abi-sys-devices-system-cpu-cpux-topology-physical-package-id
-        let physical_sockets: HashSet<_> = self.cpus.iter().map(|cpu| cpu.pkg_id).collect();
+        let physical_sockets: HashSet<_> = self.cpus.iter().filter_map(|cpu| cpu.pkg_id).collect();
 
         physical_sockets.len()
     }
 
     pub fn core_count(&self) -> usize {
-        let core_ids: HashSet<_> = self.cpus.iter().map(|cpu| cpu.core_id).collect();
+        let core_ids: HashSet<_> = self.cpus.iter().filter_map(|cpu| cpu.core_id).collect();
         core_ids.len()
     }
 }
@@ -101,6 +97,7 @@ impl CacheSize {
         Self(size)
     }
 
+    #[cfg(test)]
     fn parse(s: &str) -> Self {
         Self(parse_size::parse_size_u64(s).expect("Could not parse cache size"))
     }
@@ -131,7 +128,7 @@ impl CacheSize {
 pub fn read_online_cpus(root: &Path) -> String {
     let path = join_under_root(root, Path::new("/sys/devices/system/cpu/online"));
     fs::read_to_string(path)
-        .expect("Could not read sysfs")
+        .unwrap_or_default()
         .trim()
         .to_string()
 }
@@ -141,7 +138,9 @@ fn read_cpu_caches(root: &Path, cpu_index: usize) -> Vec<CpuCache> {
         root,
         &PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu_index}/")),
     );
-    let cache_dir = fs::read_dir(cpu_dir.join("cache")).unwrap();
+    let Ok(cache_dir) = fs::read_dir(cpu_dir.join("cache")) else {
+        return vec![];
+    };
     let cache_paths = cache_dir
         .flatten()
         .filter(|x| x.path().is_dir())
@@ -150,24 +149,32 @@ fn read_cpu_caches(root: &Path, cpu_index: usize) -> Vec<CpuCache> {
     let mut caches: Vec<CpuCache> = vec![];
 
     for cache_path in cache_paths {
-        let type_string = fs::read_to_string(cache_path.join("type")).unwrap();
-
-        let c_type = match type_string.trim() {
-            "Unified" => CacheType::Unified,
-            "Data" => CacheType::Data,
-            "Instruction" => CacheType::Instruction,
-            _ => panic!("Unrecognized cache type: {type_string}"),
+        let Ok(type_string) = fs::read_to_string(cache_path.join("type")) else {
+            continue;
         };
 
-        let c_level = fs::read_to_string(cache_path.join("level"))
-            .map(|s| s.trim().parse::<usize>().unwrap())
-            .unwrap();
+        let c_type = match type_string.trim() {
+            "Data" => CacheType::Data,
+            "Instruction" => CacheType::Instruction,
+            "Unified" => CacheType::Unified,
+            _ => continue,
+        };
 
-        let size_string = fs::read_to_string(cache_path.join("size")).unwrap();
-        let c_size = CacheSize::parse(size_string.trim());
+        let Some(c_level) = fs::read_to_string(cache_path.join("level"))
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+        else {
+            continue;
+        };
+
+        let c_size = fs::read_to_string(cache_path.join("size"))
+            .ok()
+            .and_then(|s| parse_size::parse_size_u64(s.trim()).ok())
+            .map(CacheSize::new)
+            .unwrap_or_else(|| CacheSize::new(0));
 
         let shared_cpu_map = fs::read_to_string(cache_path.join("shared_cpu_map"))
-            .unwrap()
+            .unwrap_or_default()
             .trim()
             .to_string();
 
@@ -204,12 +211,14 @@ pub fn read_cpu_vulnerabilities(root: &Path) -> Vec<CpuVulnerability> {
 
         for file in files {
             if let Ok(content) = fs::read_to_string(&file) {
-                let name = file.file_name().unwrap().to_str().unwrap();
-
-                out.push(CpuVulnerability {
-                    name: (name[..1].to_uppercase() + &name[1..]).replace("_", " "),
-                    mitigation: content.trim().to_string(),
-                });
+                if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
+                    if !name.is_empty() {
+                        out.push(CpuVulnerability {
+                            name: (name[..1].to_uppercase() + &name[1..]).replace("_", " "),
+                            mitigation: content.trim().to_string(),
+                        });
+                    }
+                }
             }
         }
     };
@@ -242,12 +251,12 @@ fn parse_cpu_list(list: &str) -> Vec<usize> {
     for part in list.trim().split(",") {
         if part.contains("-") {
             let bounds: Vec<_> = part.split("-").flat_map(|x| x.parse::<usize>()).collect();
-            assert_eq!(bounds.len(), 2);
-            for idx in bounds[0]..bounds[1] + 1 {
-                out.push(idx)
+            if bounds.len() == 2 {
+                for idx in bounds[0]..bounds[1] + 1 {
+                    out.push(idx)
+                }
             }
-        } else {
-            let idx = part.parse::<usize>().expect("Invalid CPU index value");
+        } else if let Ok(idx) = part.parse::<usize>() {
             out.push(idx);
         }
     }

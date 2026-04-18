@@ -134,19 +134,19 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                 model_name_info.add_child(CpuInfo::new("Model", &model));
             }
 
-            let socket_count = &cpu_topology.socket_count();
-            let core_count = &cpu_topology.core_count();
+            let socket_count = cpu_topology.socket_count();
+            let core_count = cpu_topology.core_count();
 
-            model_name_info.add_child(CpuInfo::new(
-                "Thread(s) per core",
-                &(cpu_topology.cpus.len() / core_count).to_string(),
-            ));
+            if core_count > 0 {
+                let threads_per_core = (cpu_topology.cpus.len() / core_count).to_string();
+                model_name_info.add_child(CpuInfo::new("Thread(s) per core", &threads_per_core));
+            }
 
-            model_name_info.add_child(CpuInfo::new(
-                "Core(s) per socket",
-                &(core_count / socket_count).to_string(),
-            ));
-            model_name_info.add_child(CpuInfo::new("Socket(s)", &socket_count.to_string()));
+            if socket_count > 0 {
+                let cores_per_socket = (core_count / socket_count).to_string();
+                model_name_info.add_child(CpuInfo::new("Core(s) per socket", &cores_per_socket));
+                model_name_info.add_child(CpuInfo::new("Socket(s)", &socket_count.to_string()));
+            }
 
             if let Some(freq_boost_enabled) = sysfs::read_freq_boost_state(root) {
                 let s = if freq_boost_enabled {
@@ -288,7 +288,7 @@ fn print_output(infos: CpuInfos, out_opts: OutputOptions) {
         .iter()
         .map(|info| get_max_field_width(info, 0))
         .max()
-        .unwrap();
+        .unwrap_or_default();
 
     print_entries(&infos.lscpu, 0, max_field_width, &out_opts);
 }

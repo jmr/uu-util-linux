@@ -21,7 +21,7 @@ const MEMORY_BLOCK_IDS: [usize; 125] = [
 ];
 
 struct TestSysMemory {
-    sysroot: String,
+    sysroot: tempfile::TempDir,
 }
 
 /// Builds up a fake /sys/devices/system/memory filesystem.
@@ -35,11 +35,9 @@ struct TestSysMemory {
 /// And removes it automatically after the reference is dropped.
 impl TestSysMemory {
     fn new() -> Self {
-        let random = rand::random::<u32>();
-        let sysroot = Path::new(&env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("testsysmem-{random}"));
+        let sysroot = tempfile::TempDir::new().unwrap();
         let sysmem = sysroot
+            .path()
             .join("sys")
             .join("devices")
             .join("system")
@@ -60,21 +58,13 @@ impl TestSysMemory {
             write_file_content(&node_dir, ".gitkeep", "");
         }
 
-        TestSysMemory {
-            sysroot: sysroot.display().to_string(),
-        }
-    }
-}
-
-impl Drop for TestSysMemory {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.sysroot).unwrap();
+        TestSysMemory { sysroot }
     }
 }
 
 fn sysroot_test_with_args(test_root: &TestSysMemory, expected_output: &str, args: &[&str]) {
     let mut cmd = new_ucmd!();
-    cmd.arg("-s").arg(&test_root.sysroot);
+    cmd.arg("-s").arg(test_root.sysroot.path());
     for arg in args {
         cmd.arg(arg);
     }
@@ -316,6 +306,37 @@ fn test_summary_conflict_pairs() {
 #[test]
 fn test_summary_conflict_raw() {
     new_ucmd!().arg("--summary").arg("-r").fails().code_is(1);
+}
+
+#[test]
+fn test_missing_sysmem() {
+    let sysroot = tempfile::tempdir().unwrap();
+
+    new_ucmd!()
+        .arg("-s")
+        .arg(sysroot.path().join("missing"))
+        .fails()
+        .code_is(1)
+        .stderr_contains("cannot open");
+}
+
+#[test]
+fn test_missing_block_size_bytes() {
+    let sysroot = tempfile::tempdir().unwrap();
+    let sysmem = sysroot
+        .path()
+        .join("sys")
+        .join("devices")
+        .join("system")
+        .join("memory");
+    std::fs::create_dir_all(&sysmem).unwrap();
+
+    new_ucmd!()
+        .arg("-s")
+        .arg(sysroot.path())
+        .fails()
+        .code_is(1)
+        .stderr_contains("cannot open");
 }
 
 #[test]

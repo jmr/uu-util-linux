@@ -49,7 +49,6 @@ fn test_output() {
     assert!(stdout.contains("\n  Model name:"));
     assert!(stdout.contains("\n    CPU Family:"));
 }
-
 #[cfg(target_os = "linux")]
 fn write_file(dir: &Path, name: &str, content: &str) {
     std::fs::create_dir_all(dir).unwrap();
@@ -188,4 +187,34 @@ fn test_sysroot_cache() {
         .no_stderr()
         .stdout_contains("Caches (sum of all):")
         .stdout_contains("(2 instances)");
+}
+
+#[test]
+fn test_missing_cache_size() {
+    let sysroot = tempfile::tempdir().unwrap();
+    let sys_cpu0_cache0 = sysroot
+        .path()
+        .join("sys/devices/system/cpu/cpu0/cache/index0");
+    std::fs::create_dir_all(&sys_cpu0_cache0).unwrap();
+
+    // Write some required files but omit 'size'
+    std::fs::write(sys_cpu0_cache0.join("type"), "Unified\n").unwrap();
+    std::fs::write(sys_cpu0_cache0.join("level"), "1\n").unwrap();
+    std::fs::write(sys_cpu0_cache0.join("shared_cpu_map"), "1\n").unwrap();
+
+    // cpu/online is also needed
+    std::fs::create_dir_all(sysroot.path().join("sys/devices/system/cpu")).unwrap();
+    std::fs::write(sysroot.path().join("sys/devices/system/cpu/online"), "0\n").unwrap();
+
+    // topology files
+    let sys_cpu0_topo = sysroot.path().join("sys/devices/system/cpu/cpu0/topology");
+    std::fs::create_dir_all(&sys_cpu0_topo).unwrap();
+    std::fs::write(sys_cpu0_topo.join("physical_package_id"), "0\n").unwrap();
+    std::fs::write(sys_cpu0_topo.join("core_id"), "0\n").unwrap();
+
+    new_ucmd!()
+        .arg("--sysroot")
+        .arg(sysroot.path())
+        .succeeds()
+        .stdout_contains("L1:                  0 B (1 instances)");
 }

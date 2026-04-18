@@ -11,7 +11,7 @@ use clap::{Arg, ArgAction};
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uucore::{error::UResult, format_usage, help_about, help_usage};
@@ -358,26 +358,25 @@ impl Options {
     }
 }
 
-fn read_info(lsmem: &mut Lsmem, opts: &mut Options) {
+fn read_info(lsmem: &mut Lsmem, opts: &mut Options) -> UResult<()> {
     let path_block_size = Path::new(&opts.sysmem).join(PATH_SUB_BLOCK_SIZE_BYTES);
-    lsmem.block_size = u64::from_str_radix(
-        &read_file_content::<String>(path_block_size.as_path())
-            .expect("Failed to read memory block size"),
-        16,
-    )
-    .unwrap();
-    lsmem.dirs = get_block_paths(opts);
+    let block_size_str = read_file_content::<String>(path_block_size.as_path())
+        .map_err(|_| uucore::error::USimpleError::new(1, format!("cannot open {}", opts.sysmem)))?;
+    lsmem.block_size = u64::from_str_radix(&block_size_str, 16)
+        .map_err(|_| uucore::error::USimpleError::new(1, "failed to parse memory block size"))?;
+
+    lsmem.dirs = get_block_paths(opts)?;
     lsmem.dirs.sort_by(|a, b| {
-        let filename_a = a.file_name().expect("Failed parsing memory block name");
-        let filename_a = filename_a.to_str().unwrap();
-        let filename_b = b.file_name().expect("Failed parsing memory block name");
-        let filename_b = filename_b.to_str().unwrap();
-        let idx_a: u64 = filename_a[PATH_NAME_MEMORY.len()..]
-            .parse()
-            .expect("Failed to parse memory block index");
-        let idx_b: u64 = filename_b[PATH_NAME_MEMORY.len()..]
-            .parse()
-            .expect("Failed to parse memory block index");
+        let filename_a = a.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let filename_b = b.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let idx_a: u64 = filename_a
+            .strip_prefix(PATH_NAME_MEMORY)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
+        let idx_b: u64 = filename_b
+            .strip_prefix(PATH_NAME_MEMORY)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
         idx_a.cmp(&idx_b)
     });
     lsmem.ndirs = lsmem.dirs.len();
@@ -411,19 +410,24 @@ fn read_info(lsmem: &mut Lsmem, opts: &mut Options) {
         lsmem.nblocks += 1;
         lsmem.blocks.push(blk.clone());
     }
+    Ok(())
 }
 
-fn get_block_paths(opts: &mut Options) -> Vec<PathBuf> {
+fn get_block_paths(opts: &mut Options) -> UResult<Vec<PathBuf>> {
     let mut paths = Vec::<PathBuf>::new();
-    for entry in fs::read_dir(&opts.sysmem).unwrap() {
-        let entry = entry.unwrap();
+    let dir = fs::read_dir(&opts.sysmem)
+        .map_err(|_| uucore::error::USimpleError::new(1, format!("cannot open {}", opts.sysmem)))?;
+    for entry in dir.flatten() {
         let path = entry.path();
-        let filename = path.file_name().unwrap().to_str().unwrap();
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if path.is_dir() && filename.starts_with(PATH_NAME_MEMORY) {
             paths.push(path);
         }
     }
-    paths
+    Ok(paths)
 }
 
 fn is_mergeable(lsmem: &Lsmem, opts: &Options, blk: &MemoryBlock) -> bool {
@@ -461,12 +465,18 @@ fn is_mergeable(lsmem: &Lsmem, opts: &Options, blk: &MemoryBlock) -> bool {
 }
 
 fn memory_block_get_node(path: &PathBuf) -> Result<i32, <i32 as FromStr>::Err> {
-    for entry in fs::read_dir(path).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        if path.is_dir() && filename.starts_with(PATH_NAME_NODE) {
-            return filename[PATH_NAME_NODE.len()..].parse();
+    if let Ok(dir) = fs::read_dir(path) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                if let Some(node_str) = filename.strip_prefix(PATH_NAME_NODE) {
+                    return node_str.parse();
+                }
+            }
         }
     }
     Ok(-1)
@@ -476,8 +486,14 @@ fn memory_block_read_attrs(opts: &Options, path: &PathBuf) -> MemoryBlock {
     let mut blk = MemoryBlock::new();
     blk.count = 1;
     blk.state = MemoryState::Unknown;
-    let filename = path.file_name().unwrap().to_str().unwrap();
-    blk.index = filename[PATH_NAME_MEMORY.len()..].parse().unwrap();
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    blk.index = filename
+        .strip_prefix(PATH_NAME_MEMORY)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let mut removable_path = path.clone();
     removable_path.push(PATH_SUB_REMOVABLE);
@@ -486,11 +502,11 @@ fn memory_block_read_attrs(opts: &Options, path: &PathBuf) -> MemoryBlock {
     let mut state_path = path.clone();
     state_path.push(PATH_SUB_STATE);
     if let Ok(state_raw) = read_file_content::<String>(&state_path) {
-        blk.state = MemoryState::from_str(&state_raw).unwrap();
+        blk.state = MemoryState::from_str(&state_raw).unwrap_or(MemoryState::Unknown);
     }
 
     if opts.have_nodes {
-        blk.node = memory_block_get_node(path).unwrap();
+        blk.node = memory_block_get_node(path).unwrap_or(-1);
     }
 
     blk.nr_zones = 0;
@@ -504,7 +520,7 @@ fn memory_block_read_attrs(opts: &Options, path: &PathBuf) -> MemoryBlock {
                 .enumerate()
                 .take(std::cmp::min(zone_toks.len(), ZoneId::MaxNrZones as usize))
             {
-                blk.zones[i] = ZoneId::from_str(&zone_tok).unwrap();
+                blk.zones[i] = ZoneId::from_str(&zone_tok).unwrap_or(ZoneId::ZoneUnknown);
                 blk.nr_zones += 1;
             }
         }
@@ -711,10 +727,7 @@ fn read_file_content<T: core::str::FromStr>(path: &Path) -> io::Result<T>
 where
     T::Err: std::fmt::Debug, // Required to unwrap the result of T::from_str
 {
-    let file = fs::File::open(path).expect("Failed to open file");
-    let mut reader = BufReader::new(file);
-    let mut content = String::new();
-    reader.read_line(&mut content).expect("Failed to read line");
+    let content = fs::read_to_string(path)?;
     content
         .trim()
         .to_string()
@@ -789,7 +802,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
             .to_string();
     }
 
-    read_info(&mut lsmem, &mut opts);
+    read_info(&mut lsmem, &mut opts)?;
 
     if opts.want_table {
         if opts.json {
